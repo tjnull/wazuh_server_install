@@ -1,58 +1,101 @@
-- name: Check if Wazuh server is already installed
+- name: Check if Wazuh is already installed
   stat:
     path: /etc/wazuh-indexer
   register: wazuh_installed
 
 - name: Install Wazuh prerequisites
-  package:
-    name: "{{ package }}"
-    state: latest
-  loop: 
+  apt:
+    name: "{{ item }}"
+    state: present
+    update_cache: yes
+  loop:
+    - curl
+    - apt-transport-https
+    - gnupg
     - ca-certificates
+    - lsb-release
+    - unzip
+    - software-properties-common
     - git
-  loop_control:
-    loop_var: package
-  when: not wazuh_installed.stat.exists 
+  when: not wazuh_installed.stat.exists
 
-- name: Download Wazuh installation script
+- name: Download Wazuh install script
   get_url:
     url: "{{ wazuh_install_script_url }}"
     dest: /tmp/wazuh-install.sh
-  when: not wazuh_installed.stat.exists 
+    mode: '0755'
+  when: not wazuh_installed.stat.exists
 
-- name: Run Wazuh installation script
-  shell: sudo bash /tmp/wazuh-install.sh -a -i > /tmp/wazuh-install-output.txt
-  when: not wazuh_installed.stat.exists 
+- name: Run Wazuh full stack install script with indexer
+  shell: bash /tmp/wazuh-install.sh -a -o -v > /tmp/wazuh-install-output.txt
+  args:
+    executable: /bin/bash
+  register: install_result
+  changed_when: "'already installed' not in install_result.stdout"
+  when: not wazuh_installed.stat.exists
 
-- name: Start Wazuh Manager service
+- name: Debug install output if failed
+  debug:
+    msg: "{{ install_result.stdout_lines }}"
+  when: 
+    - install_result is defined
+    - install_result.rc | default(0) != 0
+
+- name: Confirm Wazuh Dashboard is installed
+  stat:
+    path: /etc/systemd/system/wazuh-dashboard.service
+  register: dashboard_service
+
+- name: Fail if Wazuh Dashboard not installed after install
+  fail:
+    msg: "Wazuh Dashboard service not found. Installation may have failed."
+  when: not dashboard_service.stat.exists and not wazuh_installed.stat.exists
+
+- name: Enable and start Wazuh services
   service:
-    name: wazuh-manager
+    name: "{{ item }}"
     state: started
     enabled: yes
+  loop:
+    - wazuh-manager
+    - wazuh-indexer
+    - wazuh-dashboard
+    - filebeat
 
-- name: Download SOCFORTRESS Wazuh rules script
+- name: Wait for Wazuh Dashboard to be reachable on HTTPS
+  uri:
+    url: "https://{{ ansible_default_ipv4.address }}/"
+    validate_certs: false
+    status_code: 200
+  register: dashboard_response
+  retries: 10
+  delay: 5
+  until: dashboard_response.status == 200
+  when: dashboard_service.stat.exists
+
+- name: Copy SOCFORTRESS rules script
   copy:
     src: wazuh_socfortress_rules.sh
     dest: /tmp/wazuh_socfortress_rules.sh
-    mode: "0755"  # Ensure the script is executable
-  when: not wazuh_installed.stat.exists 
+    mode: "0755"
+  when: not wazuh_installed.stat.exists
 
 - name: Run SOCFORTRESS Wazuh rules script
-  shell: sudo bash /tmp/wazuh_socfortress_rules.sh
-  when: not wazuh_installed.stat.exists 
+  shell: bash /tmp/wazuh_socfortress_rules.sh
+  when: not wazuh_installed.stat.exists
 
-- name: Extract username and password
+- name: Extract dashboard credentials
   shell: "grep -E 'User:|Password:' /tmp/wazuh-install-output.txt | awk '{print $NF}'"
   register: access_info
-  when: not wazuh_installed.stat.exists and not wazuh_admin_password is defined
+  when: not wazuh_installed.stat.exists and wazuh_admin_password is not defined
 
-- name: Display username and password
-  ansible.builtin.debug:
+- name: Display dashboard credentials
+  debug:
     msg:
       - "Username: {{ access_info.stdout_lines[0] }}"
       - "Password: {{ access_info.stdout_lines[1] }}"
-  when: not wazuh_installed.stat.exists and not wazuh_admin_password is defined
+  when: not wazuh_installed.stat.exists and wazuh_admin_password is not defined
 
-- name: Change admin password
-  ansible.builtin.command: "/usr/share/wazuh-indexer/plugins/opensearch-security/tools/wazuh-passwords-tool.sh -u admin -p '{{ wazuh_admin_password }}'"
-  when: wazuh_admin_password is defined  
+- name: Change admin password if defined
+  command: "/usr/share/wazuh-indexer/plugins/opensearch-security/tools/wazuh-passwords-tool.sh -u admin -p '{{ wazuh_admin_password }}'"
+  when: wazuh_admin_password is defined
